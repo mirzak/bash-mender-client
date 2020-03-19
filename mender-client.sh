@@ -87,7 +87,8 @@ function wait_for_authorized() {
 EOF
 
   while true; do
-    echo "Send authorization request"
+    echo "Send authorization request."
+    echo "Please authorization the device on the server for it to proceed"
     status_code=$(auth_request_status)
     if [ "$status_code" == "200" ]; then
         echo "Client has been authorized"
