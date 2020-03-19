@@ -63,7 +63,7 @@ function generate_signature() {
 
 function auth_request_status() {
   x_men_signature=$(generate_signature)
-  curl -vvv -k -s -o /dev/null -w '%{http_code}' \
+  curl -k -s -o /dev/null -w '%{http_code}' \
     -H "Content-Type: application/json" \
     -H "X-MEN-Signature: ${x_men_signature}" \
     --data "@auth.json" \
