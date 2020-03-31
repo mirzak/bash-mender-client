@@ -1,9 +1,9 @@
 #!/bin/bash
 
-MENDER_SERVER_URL=${MENDER_SERVER_URL}
 MENDER_TENANT_TOKEN=${MENDER_TENANT_TOKEN}
 
-MENDER_DEVICE_TYPE=${DEVICE_TYPE:-"raspberrypi4"}
+MENDER_SERVER_URL=${MENDER_SERVER_URL:-"https://hosted.mender.io"}
+MENDER_DEVICE_TYPE=${DEVICE_TYPE:-"bash-client"}
 
 # This variable is mutable
 MENDER_ARTIFACT_NAME="release-v1"
