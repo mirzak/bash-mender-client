@@ -20,8 +20,12 @@ openssl rsa -in keys/private.key -out keys/public.key -pubout
 Start the client:
 
 ```
+# These are optional and these are the default values
 export MENDER_SERVER_URL="https://hosted.mender.io"
-export MENDER_TENANT_TOKEN="<paste your token here"
 export MENDER_DEVICE_TYPE="mender-bash"
+
+# This one is mandatory
+export MENDER_TENANT_TOKEN="<paste your token here"
+
 ./mender-client.sh
 ```
