@@ -1,12 +1,21 @@
 #!/bin/bash
 
+RUNNING_FILE=/tmp/mender-client-$$.run
+KEYS_DIR=${KEYS_DIR:-"./keys"}
+MENDER_SERVER_URL=${MENDER_SERVER_URL:-"https://hosted.mender.io"}
 MENDER_TENANT_TOKEN=${MENDER_TENANT_TOKEN}
 
-MENDER_SERVER_URL=${MENDER_SERVER_URL:-"https://hosted.mender.io"}
-MENDER_DEVICE_TYPE=${DEVICE_TYPE:-"bash-client"}
+hexchars="0123456789ABCDEF"
+end=$( for i in {1..6} ; do echo -n ${hexchars:$(( $RANDOM % 16 )):1} ; done | sed -e 's/\(..\)/:\1/g' )
+MENDER_DEVICE_MAC_ADDRESS=${DEVICE_MAC_ADDRESS:-"00:11:22${end}"}
+RATE_LIMIT_SLEEP_INTERVAL=${RATE_LIMIT_SLEEP_INTERVAL:-"10"}
+
+CURL_OPTIONS=""
+
+MENDER_DEVICE_TYPE=${MENDER_DEVICE_TYPE:-"raspberrypi4"}
 
 # This variable is mutable
-MENDER_ARTIFACT_NAME="release-v1"
+MENDER_ARTIFACT_NAME=${MENDER_ARTIFACT_NAME:-"release-v1"}
 
 function show_help() {
   cat << EOF
@@ -29,6 +38,12 @@ Usage: ./$0 COMMAND [options]
 Options:
   -t, --token                 - Mender server tenant token
   -d, --device-type           - Device type string to report to the server
+  -s, --server-url            - Mender server URL
+  -k, --keys-dir              - Client's keys directory
+  -m, --mac-address           - Client's MAC address
+  -r, --rate-limit            - Rate limit (sleep interval)
+  -a, --artifact-name         - Artifact name
+  --debug                     - Enables debug mode
 
 EOF
 }
@@ -47,6 +62,22 @@ You can generate a key-pair using the following commands:
 EOF
 }
 
+function log() {
+  echo -n "[$(date +%T.%N)] "
+  echo -e $1
+}
+
+function check_input() {
+    [[ -z "$MENDER_SERVER_URL" || "$MENDER_SERVER_URL" == "" ]] && { log "WARN: MENDER_SERVER_URL is not set, using default '$MENDER_SERVER_URL'"; }
+    [[ -z "$KEYS_DIR" || "$KEYS_DIR" == "" ]] && { log "WARN: KEYS_DIR is not set, using default '$KEYS_DIR'"; }
+    [[ -z "${MENDER_TENANT_TOKEN}" || -z "${MENDER_TENANT_TOKEN}" ]] && { show_help; exit 1; }
+    [[ ! -e "${KEYS_DIR}"/private.key || ! -e "${KEYS_DIR}"/public.key ]] && { show_help_keys; exit 1; }
+    if [ "$DEBUG" == "1" ]; then
+      CURL_OPTIONS=" -vvvv "
+      set -x
+    fi
+}
+
 function normalize_data() {
     echo "$1" | tr -d '\n' | tr -d '\r'
 }
@@ -58,12 +89,12 @@ function generate_signature() {
   # here as this will be removed when the request is made and if they are not
   # cleaned up the signature will invalid
   normalize_data "$(cat auth.json)" | \
-    openssl dgst -sha256 -sign keys/private.key | openssl base64 -A
+    openssl dgst -sha256 -sign "${KEYS_DIR}"/private.key | openssl base64 -A
 }
 
 function auth_request_status() {
   x_men_signature=$(generate_signature)
-  curl -k -s -o /dev/null -w '%{http_code}' \
+  curl ${CURL_OPTIONS} -k -s -o /dev/null -w '%{http_code}' \
     -H "Content-Type: application/json" \
     -H "X-MEN-Signature: ${x_men_signature}" \
     --data "@auth.json" \
@@ -72,35 +103,34 @@ function auth_request_status() {
 
 # $1 - path to data JSON file for auth request
 function wait_for_authorized() {
+  log "Prepare authorization request"
   # Replace newlines with \n
-  pubkey=$(awk 'NF {sub(/\r/, ""); printf "%s\\n",$0;}' keys/public.key)
-  hexchars="0123456789ABCDEF"
-  end=$( for i in {1..6} ; do echo -n ${hexchars:$(( $RANDOM % 16 )):1} ; done | sed -e 's/\(..\)/:\1/g' )
+  pubkey=$(awk 'NF {sub(/\r/, ""); printf "%s\\n",$0;}' "${KEYS_DIR}"/public.key)
 
   # Prepare authorization request
   cat <<- EOF > auth.json
 {
-    "id_data": "{ \"mac\": \"00:11:22${end}\"}",
+    "id_data": "{ \"mac\": \"${MENDER_DEVICE_MAC_ADDRESS}\"}",
     "pubkey": "${pubkey}",
     "tenant_token": "${MENDER_TENANT_TOKEN}"
 }
 EOF
 
-  while true; do
-    echo "Send authorization request."
-    echo "Please authorization the device on the server for it to proceed"
+  log "Send authorization request for '$MENDER_DEVICE_MAC_ADDRESS'"
+  while [ -f "$RUNNING_FILE" ]; do
     status_code=$(auth_request_status)
     if [ "$status_code" == "200" ]; then
-        echo "Client has been authorized"
+        log "Client has been authorized"
       break;
     fi
+    echo -n "."
     sleep 5
   done
 }
 
 function get_jwt() {
   x_men_signature=$(generate_signature)
-  curl -k \
+  curl ${CURL_OPTIONS} -s -k \
     -H "Content-Type: application/json" \
     -H "X-MEN-Signature: ${x_men_signature}" \
     --data "@auth.json" \
@@ -108,6 +138,8 @@ function get_jwt() {
 }
 
 function send_inventory() {
+  [[ -z "$MENDER_ARTIFACT_NAME" ]] && { log "ERROR: MENDER_ARTIFACT_NAME is empty"; exit 1; }
+  log "Send inventory data..."
   cat <<- EOF > inventory.json
 [
     {
@@ -125,7 +157,7 @@ function send_inventory() {
 ]
 EOF
 
-  curl -k \
+  curl ${CURL_OPTIONS} -k \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $JWT" \
     --data "@inventory.json" \
@@ -134,26 +166,33 @@ EOF
 }
 
 function deployments_status() {
-  curl -k -s -o /dev/null -w '%{http_code}' \
+  [[ -z "$MENDER_ARTIFACT_NAME" || "$MENDER_ARTIFACT_NAME" == "" ]] && { log "ERROR: MENDER_ARTIFACT_NAME is empty"; exit 1; }
+  curl ${CURL_OPTIONS} -k -s -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer $JWT" \
     -X GET \
     "${MENDER_SERVER_URL}/api/devices/v1/deployments/device/deployments/next?artifact_name=${MENDER_ARTIFACT_NAME}&device_type=${MENDER_DEVICE_TYPE}"
 }
 
 function check_deployment() {
-  while true; do
-    echo "Check for deployments..."
+  log "Checking for deployments with artifact '$MENDER_ARTIFACT_NAME'"
+  while [ -f "$RUNNING_FILE" ]; do
     status_code=$(deployments_status)
     if [ "$status_code" == "200" ]; then
-      echo "There is a deployments waiting for us"
+      echo ""
+      log "There is a deployments waiting for us"
       break;
+    elif [ "$status_code" == "401" ]; then
+      log "JWT token expired, obtain a new one"
+      JWT=$(get_jwt)
     fi
+    echo -n "."
     sleep 5
   done
 }
 
 function get_deplyoment() {
-  curl -k \
+  [[ -z "$MENDER_ARTIFACT_NAME" || "$MENDER_ARTIFACT_NAME" == "" ]] && { log "ERROR: MENDER_ARTIFACT_NAME is empty"; exit 1; }
+  curl ${CURL_OPTIONS} -s -k \
     -H "Authorization: Bearer $JWT" \
     -X GET \
     "${MENDER_SERVER_URL}/api/devices/v1/deployments/device/deployments/next?artifact_name=${MENDER_ARTIFACT_NAME}&device_type=${MENDER_DEVICE_TYPE}"
@@ -162,14 +201,28 @@ function get_deplyoment() {
 # $1 - deployment id
 # $2 - enum (installing, downloading, rebooting, success, failure, already-installed)
 function set_deplyoment_status() {
-  echo "${1}: state changed to: ${2}"
-  curl -k \
+  [[ -z "$1" ]] && { log "ERROR: \$1 (deployment id) is empty"; exit 1; }
+  [[ -z "$2" ]] && { log "ERROR: \$2 (status) is empty"; exit 1; }
+  log "Deployment '${1}': state changed to '${2}'"
+  curl ${CURL_OPTIONS} -k \
     -H "Authorization: Bearer $JWT" \
     -H "Content-Type: application/json" \
     -d "{\"status\":\"${2}\"}" \
     -X PUT \
     "${MENDER_SERVER_URL}/api/devices/v1/deployments/device/deployments/${1}/status"
 }
+
+function download_artifact() {
+  set_deplyoment_status "${deployment_id}" "downloading"
+
+  log "Downloading artifact: ${deployment_url}"
+  # Here one would decompress the artifact and write it to the storage medium
+  set -e
+  curl -s -k -o /dev/null ${deployment_url}
+  log "Artifact downloading is done"
+  set +e
+}
+
 
 while (( "$#" )); do
   case "$1" in
@@ -181,6 +234,30 @@ while (( "$#" )); do
       MENDER_DEVICE_TYPE="${2}"
       shift 2
       ;;
+    -s | --server-url)
+      MENDER_SERVER_URL="${2}"
+      shift 2
+      ;;
+    -k | --keys-dir)
+      KEYS_DIR="${2}"
+      shift 2
+      ;;
+    -m | --mac-address)
+      MENDER_DEVICE_MAC_ADDRESS="${2}"
+      shift 2
+      ;;
+    -r | --rate-limit)
+      RATE_LIMIT_SLEEP_INTERVAL="${2}"
+      shift 2
+      ;;
+    -a | --artifact-name)
+      MENDER_ARTIFACT_NAME="${2}"
+      shift 2
+      ;;
+    --debug)
+      DEBUG=1
+      shift 1
+      ;;
     *)
       show_help
       exit 1
@@ -188,43 +265,43 @@ while (( "$#" )); do
   esac
 done
 
-if [ -z "${MENDER_TENANT_TOKEN}" ] || [ -z "${MENDER_TENANT_TOKEN}" ]; then
-  show_help
-  exit 1
-fi
+check_input
 
-if [ ! -e keys/private.key ] || [ ! -e keys/public.key ]; then
-  show_help_keys
-  exit 1
-fi
 
-echo "Prepare authorization request"
+# Main logic execution
+[ -f "$RUNNING_FILE" ] && exit 2
+
+echo $$ > "$RUNNING_FILE";
+log "Starting... 'rm -f $RUNNING_FILE' to quit"
+
+
+# Send auth request and wait while authorized
 wait_for_authorized
 
 # Once we are are authorized with the server we can download a time limited
 # JSON Web Token which we will be used for all subsequent API calls.
-
-echo "Fetch JSON Web Token"
+log "Fetch JSON Web Token"
 JWT=$(get_jwt)
 
-echo "Send inventory data..."
+# Send inventory data
 send_inventory
 
-while true; do
+while [ -f "$RUNNING_FILE" ]; do
   check_deployment
 
+  # sleep $RATE_LIMIT_SLEEP_INTERVAL seconds to avoid being rate limited (429)
+  sleep ${RATE_LIMIT_SLEEP_INTERVAL}
+
   # Handle deployment
-
+  log "Getting deployment"
   deployment_json=$(get_deplyoment)
-
+  [[ -z "$deployment_json" || "$deployment_json" == "" ]] && { log "ERROR: failed to get deployment"; exit 1; }
   deployment_id=$(jq -r '.id' <<< ${deployment_json})
   deployment_url=$(jq -r '.artifact.source.uri' <<< ${deployment_json})
+  [[ -z "$deployment_id" || "$deployment_id" == "" ]] && { log "ERROR: \$deployment_id is empty"; exit 1; }
+  [[ -z "$deployment_url" || "$deployment_url" == "" ]] && { log "ERROR: \$deployment_url is empty"; exit 1; }
 
-  echo "Downloading artifact: ${deployment_url}"
-  set_deplyoment_status "${deployment_id}" "downloading"
-
-  # Here one would decompress the artifact and write it to the storage medium
-  wget -O /dev/null ${deployment_url}
+  download_artifact
 
   # Here one would prepare the bootloader flags prior to restarting and try
   # booting the new image
@@ -245,6 +322,7 @@ while true; do
 
   # Update artifact name
   MENDER_ARTIFACT_NAME=$(jq -r '.artifact.artifact_name' <<< ${deployment_json})
+  [[ -z "$MENDER_ARTIFACT_NAME" || "$MENDER_ARTIFACT_NAME" == "" ]] && { log "ERROR: MENDER_ARTIFACT_NAME is empty"; exit 1; }
 
   # Push inventory so that artifact_name change is reflected on the server
   send_inventory
